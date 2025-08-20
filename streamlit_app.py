@@ -1,22 +1,18 @@
-# app.py — Zoom → Customer Success Tab (.docx) with ZERO runtime installs
-# - Upload transcript (.txt/.vtt/.srt/.docx/.pdf)
-# - Optional: upload previous CS-Tab .docx to preserve history (we parse DOCX XML directly)
-# - LLM (OpenAI) if key provided; else offline heuristic
-# - Recompute word-limited summaries from FULL history
-# - Output a .docx using a tiny internal DOCX builder (no python-docx)
+# app.py — Zoom → Customer Success Tab (.docx) with bullets + rules
+# - No runtime installs; only stdlib + streamlit
+# - Bulleted "Sentiment History" per section
+# - Relationship sentiment mirrors Overall (green/yellow/red mapping)
+# - Consumption: if not mentioned in transcript and no prior history → "Consumption not discussed on call."
 
 import os, io, re, json, zipfile, html, xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import streamlit as st
 
-# ---------------------------
-# App layout
-# ---------------------------
 st.set_page_config(page_title="Zoom → Customer Success Tab (Word)", layout="wide")
 st.title("Zoom → Customer Success Tab (Word)")
-st.caption("Upload a Zoom transcript (+ optional prior CS-Tab .docx). Get a refreshed .docx with new history entries and updated summaries. No external installs.")
+st.caption("Upload Zoom transcript (+ optional prior CS-Tab .docx). Appends new history, recomputes summaries, and outputs a beautified Word doc with bullet points.")
 
 # ---------------------------
 # Sections & defaults
@@ -31,9 +27,10 @@ SECTION_ORDER = [
     ("implementation", "Implementation Sentiment"),
 ]
 DEFAULT_WORD_LIMIT = 50
+MONTH_RX = r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$"
 
 # ---------------------------
-# Helpers: read transcript files
+# Transcript readers (stdlib only)
 # ---------------------------
 def read_txt_bytes(raw: bytes) -> str:
     return raw.decode("utf-8", errors="ignore")
@@ -50,7 +47,6 @@ def read_vtt_srt(raw: bytes) -> str:
     return "\n".join([l for l in lines if l.strip()])
 
 def extract_docx_paragraphs(raw: bytes) -> List[str]:
-    """Return plain text paragraphs from a .docx using only stdlib."""
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             xml_bytes = z.read("word/document.xml")
@@ -61,7 +57,6 @@ def extract_docx_paragraphs(raw: bytes) -> List[str]:
             texts = []
             for t in p.findall(".//w:t", ns):
                 texts.append(t.text or "")
-            # handle line breaks inside runs
             for br in p.findall(".//w:br", ns):
                 texts.append("\n")
             para = "".join(texts).replace("\xa0", " ").strip()
@@ -75,15 +70,11 @@ def read_docx_as_text(raw: bytes) -> str:
     return "\n".join(paras)
 
 def read_pdf_as_text(raw: bytes) -> str:
-    """Very light PDF text grabber: pulls /Contents streams and strips.
-       Not perfect, but works for texty PDFs without external libs."""
     try:
         txt = raw.decode("latin-1", errors="ignore")
-        # naive extract between BT/ET text operators
         chunks = re.findall(r"BT(.*?)ET", txt, flags=re.S)
         out = []
         for c in chunks:
-            # pull text in parentheses, remove Tj/TJ ops
             pieces = re.findall(r"\((.*?)\)", c, flags=re.S)
             line = " ".join(p.replace("\\)", ")").replace("\\(", "(").replace("\\n", " ") for p in pieces)
             out.append(line)
@@ -93,24 +84,21 @@ def read_pdf_as_text(raw: bytes) -> str:
 
 def read_uploaded_text(file) -> str:
     name = (file.name or "").lower()
-    raw = file.read()
-    file.seek(0)
-    if name.endswith(".txt"): return read_txt_bytes(raw)
+    raw = file.read(); file.seek(0)
+    if name.endswith(".txt"):  return read_txt_bytes(raw)
     if name.endswith(".vtt") or name.endswith(".srt"): return read_vtt_srt(raw)
     if name.endswith(".docx"): return read_docx_as_text(raw)
-    if name.endswith(".pdf"): return read_pdf_as_text(raw)
+    if name.endswith(".pdf"):  return read_pdf_as_text(raw)
     return read_txt_bytes(raw)
 
 # ---------------------------
-# Parse existing CS-Tab .docx (produced by this app or similar)
+# Parse existing CS-Tab .docx
 # ---------------------------
 def parse_existing_cstab_docx(file) -> Dict[str, Dict[str, str]]:
     result = {k: {"sentiment": "", "summary": "", "history_text": ""} for k, _ in SECTION_ORDER}
     try:
-        raw = file.read()
-        file.seek(0)
+        raw = file.read(); file.seek(0)
         paras = extract_docx_paragraphs(raw)
-        # Walk paragraphs: headings match section labels; then labeled blocks
         key, field = None, None
         labels = {label: k for k, label in SECTION_ORDER}
         for p in paras:
@@ -118,12 +106,9 @@ def parse_existing_cstab_docx(file) -> Dict[str, Dict[str, str]]:
             if t in labels:
                 key, field = labels[t], None
                 continue
-            if t == "Sentiment":
-                field = "sentiment";  continue
-            if t == "Sentiment Summary":
-                field = "summary";    continue
-            if t == "Sentiment History":
-                field = "history_text"; continue
+            if t == "Sentiment":          field = "sentiment";      continue
+            if t == "Sentiment Summary":  field = "summary";        continue
+            if t == "Sentiment History":  field = "history_text";   continue
             if key and field is not None:
                 prev = result[key].get(field, "")
                 result[key][field] = (prev + ("\n" if prev else "") + t).strip()
@@ -132,7 +117,7 @@ def parse_existing_cstab_docx(file) -> Dict[str, Dict[str, str]]:
         return result
 
 # ---------------------------
-# Offline heuristic extractor & summarizer
+# Heuristic extractor & summarizer
 # ---------------------------
 POSITIVE_KWS = ["happy","satisfied","good","improving","stable","resolved","green","renewed","auto-renew"]
 NEGATIVE_KWS = ["blocked","delay","issue","problem","risk","concern","bad","red","escalat","degrad","churn"]
@@ -182,7 +167,7 @@ def heuristic_summary(full_history: str, word_limit: int) -> str:
     return " ".join(words[:word_limit]) if words else "NA"
 
 # ---------------------------
-# Optional OpenAI (no dependency at import)
+# Optional OpenAI (if key provided)
 # ---------------------------
 def get_openai_client():
     try:
@@ -253,15 +238,15 @@ History:
     return " ".join(words[:word_limit]) if words else "NA"
 
 # ---------------------------
-# Tiny DOCX builder (no deps)
+# Tiny DOCX builder with bullets
 # ---------------------------
-# Minimal styles + document boilerplate
 CONTENT_TYPES_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+  <Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
 </Types>
 """
 RELS_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -275,19 +260,12 @@ DOC_RELS_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 STYLES_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
-    <w:name w:val="Normal"/>
-    <w:qFormat/>
+    <w:name w:val="Normal"/><w:qFormat/>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Title">
-    <w:name w:val="Title"/>
-    <w:qFormat/>
+    <w:name w:val="Title"/><w:qFormat/>
     <w:pPr><w:spacing w:after="200"/></w:pPr>
     <w:rPr><w:b/><w:sz w:val="40"/></w:rPr>
-  </w:style>
-  <w:style w:type="paragraph" w:styleId="Heading1">
-    <w:name w:val="Heading 1"/><w:qFormat/>
-    <w:pPr><w:spacing w:after="120"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="32"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading2">
     <w:name w:val="Heading 2"/><w:qFormat/>
@@ -296,35 +274,65 @@ STYLES_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   </w:style>
 </w:styles>
 """
+# Bullet numbering (numId 1)
+NUMBERING_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:multiLevelType w:val="hybridMultilevel"/>
+    <w:lvl w:ilvl="0">
+      <w:numFmt w:val="bullet"/><w:lvlText w:val="•"/>
+      <w:pPr/><w:rPr><w:sz w:val="24"/></w:rPr>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>
+"""
 
-def p(style: Optional[str], text: str, bold=False) -> str:
-    """Create a paragraph with optional style and bold run."""
+def par(style: Optional[str], text: str, bold=False) -> str:
     text = html.escape(text).replace("\n", "<w:br/>")
     rpr = "<w:rPr><w:b/></w:rPr>" if bold else ""
     ppr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
     return f'<w:p>{ppr}<w:r>{rpr}<w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
 
+def bullet_par(text: str, level: int = 0) -> str:
+    text = html.escape(text).replace("\n", "<w:br/>")
+    num = f'<w:pPr><w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="1"/></w:numPr></w:pPr>'
+    return f'<w:p>{num}<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+
+def history_to_bullets(history_text: str) -> List[str]:
+    """Collapse history into bullets: 'Month YYYY — summary' per item."""
+    if not history_text.strip(): return []
+    lines = [l.strip() for l in history_text.splitlines() if l.strip()]
+    bullets, current_date, buf = [], None, []
+    for ln in lines:
+        if re.match(MONTH_RX, ln):
+            if current_date or buf:
+                bullets.append(f"{current_date} — {' '.join(buf).strip()}")
+            current_date, buf = ln, []
+        else:
+            buf.append(ln)
+    if current_date or buf:
+        date_prefix = current_date + " — " if current_date else ""
+        bullets.append(f"{date_prefix}{' '.join(buf).strip()}")
+    return bullets
+
 def build_docx_bytes(title: str, assembled: Dict[str, Dict[str, str]]) -> bytes:
-    body_parts = [p("Title", title)]
+    body = [par("Title", title)]
     for key, label in SECTION_ORDER:
         s = assembled.get(key, {})
-        body_parts.append(p("Heading2", label))
-        body_parts.append(p(None, "Sentiment", bold=True))
-        body_parts.append(p(None, (s.get("sentiment") or "NA")))
-        body_parts.append(p(None, "Sentiment Summary", bold=True))
-        body_parts.append(p(None, (s.get("summary") or "NA")))
-        body_parts.append(p(None, "Sentiment History", bold=True))
-        hist = s.get("history_text","")
-        if hist.strip():
-            for line in hist.splitlines():
-                body_parts.append(p(None, line))
-        else:
-            body_parts.append(p(None, ""))
+        body.append(par("Heading2", label))
+        body.append(par(None, "Sentiment", bold=True))
+        body.append(par(None, (s.get("sentiment") or "NA")))
+        body.append(par(None, "Sentiment Summary", bold=True))
+        body.append(par(None, (s.get("summary") or "NA")))
+        body.append(par(None, "Sentiment History", bold=True))
+        for item in history_to_bullets(s.get("history_text","")) or [""]:
+            body.append(bullet_par(item))
 
     document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
-    {''.join(body_parts)}
+    {''.join(body)}
     <w:sectPr></w:sectPr>
   </w:body>
 </w:document>'''.encode("utf-8")
@@ -335,12 +343,13 @@ def build_docx_bytes(title: str, assembled: Dict[str, Dict[str, str]]) -> bytes:
         z.writestr("_rels/.rels", RELS_XML)
         z.writestr("word/_rels/document.xml.rels", DOC_RELS_XML)
         z.writestr("word/styles.xml", STYLES_XML)
+        z.writestr("word/numbering.xml", NUMBERING_XML)
         z.writestr("word/document.xml", document_xml)
     buf.seek(0)
     return buf.getvalue()
 
 # ---------------------------
-# UI controls
+# UI
 # ---------------------------
 left, right = st.columns([2,1])
 with left:
@@ -358,8 +367,7 @@ with st.expander("Per-section word limits (optional)"):
 
 st.markdown("**LLM (optional)** — paste your key to improve extraction & summaries. Leave blank to use the offline heuristic.")
 openai_key = st.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY",""))
-if openai_key:
-    st.session_state["openai_key"] = openai_key
+if openai_key: st.session_state["openai_key"] = openai_key
 
 st.markdown("**Upload Zoom transcript/summary**")
 f_transcript = st.file_uploader("Transcript (.txt, .vtt, .srt, .docx, .pdf)", type=["txt","vtt","srt","docx","pdf"])
@@ -370,26 +378,18 @@ f_prev = st.file_uploader("Previous CS-Tab (.docx)", type=["docx"])
 go = st.button("Generate Word document", type="primary", disabled=not f_transcript)
 
 # ---------------------------
-# Main action
+# Main
 # ---------------------------
 if go:
     transcript_text = read_uploaded_text(f_transcript)
 
-    # Parse previous doc to preserve history/sentiment if present
     prev = {k: {"sentiment":"", "summary":"", "history_text":""} for k,_ in SECTION_ORDER}
     if f_prev:
         prev = parse_existing_cstab_docx(f_prev)
 
     client = get_openai_client()
+    new_map = llm_extract_new_entries(client, transcript_text, model=model_name) if client else heuristic_extract_new_entries(transcript_text)
 
-    # 1) Extract NEW per-section history + sentiment
-    if client:
-        new_map = llm_extract_new_entries(client, transcript_text, model=model_name)
-    else:
-        st.info("No OpenAI key supplied — using offline heuristic.")
-        new_map = heuristic_extract_new_entries(transcript_text)
-
-    # 2) Assemble histories and recompute summaries
     assembled: Dict[str, Dict[str, str]] = {}
     for key, label in SECTION_ORDER:
         prev_hist = (prev.get(key, {}) or {}).get("history_text","").strip()
@@ -404,11 +404,17 @@ if go:
         full_history = "\n".join(parts).strip()
 
         limit = word_limits.get(key, default_limit)
+        # Summaries
         if client:
             summary_text = llm_summary_from_history(client, full_history, limit, model=model_name)
         else:
             summary_text = heuristic_summary(full_history, limit)
 
+        # Consumption override: not discussed this call AND no prior history → set special message
+        if key == "consumption" and not new_entry and not prev_hist:
+            summary_text = "Consumption not discussed on call."
+
+        # Sentiment: prefer new; if NA and previous exists, keep previous
         new_s = (new_map.get(key, {}).get("sentiment") or "NA")
         if (not new_s or new_s == "NA") and prev.get(key,{}).get("sentiment","").strip():
             new_s = prev[key]["sentiment"].strip()
@@ -419,17 +425,27 @@ if go:
             "history_text": full_history
         }
 
-    # 3) Build .docx
+    # Relationship sentiment rule = mirror Overall
+    overall_s = (assembled.get("overall", {}).get("sentiment","") or "").lower()
+    if overall_s:
+        if "red" in overall_s:
+            assembled["relationship"]["sentiment"] = "Red"
+        elif "green" in overall_s:
+            assembled["relationship"]["sentiment"] = "Green"
+        else:  # middle/amber/yellow/unknown
+            assembled["relationship"]["sentiment"] = "Yellow"
+
+    # Build DOCX
     title = f"Customer Success Tab — {account}" if account else "Customer Success Tab"
     doc_bytes = build_docx_bytes(title, assembled)
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
     fname = f"CS_Tab_{account or 'Account'}_{stamp}.docx"
 
-    st.success("Document generated.")
+    st.success("Document generated with bulleted histories and custom rules.")
     st.download_button("Download Word document", data=doc_bytes, file_name=fname,
                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-    # 4) On-page preview
+    # Preview
     st.divider()
     st.subheader("Preview")
     for key, label in SECTION_ORDER:
@@ -439,4 +455,5 @@ if go:
         st.markdown(f"**Sentiment Summary** (≤ {word_limits.get(key, default_limit)} words)")
         st.write(s["summary"])
         st.markdown("**Sentiment History** (newest first)")
-        st.text(s["history_text"])
+        for item in history_to_bullets(s["history_text"]) or ["—"]:
+            st.markdown(f"- {item}")
