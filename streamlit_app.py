@@ -1,8 +1,9 @@
 # app.py — Zoom → Customer Success Tab (.docx) with bullets + rules
 # - No runtime installs; only stdlib + streamlit
-# - Bulleted "Sentiment History" per section
-# - Relationship sentiment mirrors Overall (green/yellow/red mapping)
-# - Consumption: if not mentioned in transcript and no prior history → "Consumption not discussed on call."
+# - Bulleted "Sentiment History" per section (proper Word bullets)
+# - Relationship sentiment mirrors Overall (Green/Yellow/Red mapping)
+# - Consumption: if not mentioned in the uploaded transcript → summary = "Consumption not discussed on call."
+# - Optional OpenAI usage if a key is provided; otherwise offline heuristics
 
 import os, io, re, json, zipfile, html, xml.etree.ElementTree as ET
 from datetime import datetime
@@ -47,6 +48,7 @@ def read_vtt_srt(raw: bytes) -> str:
     return "\n".join([l for l in lines if l.strip()])
 
 def extract_docx_paragraphs(raw: bytes) -> List[str]:
+    """Parse .docx using stdlib zipfile + WordprocessingML."""
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             xml_bytes = z.read("word/document.xml")
@@ -57,7 +59,7 @@ def extract_docx_paragraphs(raw: bytes) -> List[str]:
             texts = []
             for t in p.findall(".//w:t", ns):
                 texts.append(t.text or "")
-            for br in p.findall(".//w:br", ns):
+            for _ in p.findall(".//w:br", ns):
                 texts.append("\n")
             para = "".join(texts).replace("\xa0", " ").strip()
             paragraphs.append(para)
@@ -70,6 +72,7 @@ def read_docx_as_text(raw: bytes) -> str:
     return "\n".join(paras)
 
 def read_pdf_as_text(raw: bytes) -> str:
+    """Very light PDF text extractor (best effort)."""
     try:
         txt = raw.decode("latin-1", errors="ignore")
         chunks = re.findall(r"BT(.*?)ET", txt, flags=re.S)
@@ -254,8 +257,11 @@ RELS_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>
 """
+# Relationship from document to numbering part (helps some Word viewers)
 DOC_RELS_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdNum" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
+</Relationships>
 """
 STYLES_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -274,8 +280,8 @@ STYLES_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   </w:style>
 </w:styles>
 """
-# Bullet numbering (numId 1)
-NUMBERING_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+# Bullet numbering (numId 1) — Unicode string encoded to UTF-8 to allow "•"
+NUMBERING_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:abstractNum w:abstractNumId="0">
     <w:multiLevelType w:val="hybridMultilevel"/>
@@ -286,7 +292,7 @@ NUMBERING_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   </w:abstractNum>
   <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
 </w:numbering>
-"""
+""".encode("utf-8")
 
 def par(style: Optional[str], text: str, bold=False) -> str:
     text = html.escape(text).replace("\n", "<w:br/>")
@@ -300,7 +306,7 @@ def bullet_par(text: str, level: int = 0) -> str:
     return f'<w:p>{num}<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
 
 def history_to_bullets(history_text: str) -> List[str]:
-    """Collapse history into bullets: 'Month YYYY — summary' per item."""
+    """Collapse history into bullets: 'Month YYYY — summary' per item (newest-first block)."""
     if not history_text.strip(): return []
     lines = [l.strip() for l in history_text.splitlines() if l.strip()]
     bullets, current_date, buf = [], None, []
@@ -312,7 +318,7 @@ def history_to_bullets(history_text: str) -> List[str]:
         else:
             buf.append(ln)
     if current_date or buf:
-        date_prefix = current_date + " — " if current_date else ""
+        date_prefix = f"{current_date} — " if current_date else ""
         bullets.append(f"{date_prefix}{' '.join(buf).strip()}")
     return bullets
 
@@ -326,8 +332,12 @@ def build_docx_bytes(title: str, assembled: Dict[str, Dict[str, str]]) -> bytes:
         body.append(par(None, "Sentiment Summary", bold=True))
         body.append(par(None, (s.get("summary") or "NA")))
         body.append(par(None, "Sentiment History", bold=True))
-        for item in history_to_bullets(s.get("history_text","")) or [""]:
-            body.append(bullet_par(item))
+        items = history_to_bullets(s.get("history_text",""))
+        if items:
+            for item in items:
+                body.append(bullet_par(item))
+        else:
+            body.append(bullet_par(""))  # empty bullet for visual consistency
 
     document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -395,6 +405,7 @@ if go:
         prev_hist = (prev.get(key, {}) or {}).get("history_text","").strip()
         new_entry = (new_map.get(key, {}).get("new_history_entry") or "").strip()
 
+        # Build newest-first history
         parts = []
         if new_entry:
             parts.append(meet_date)
@@ -403,15 +414,15 @@ if go:
             parts.append(prev_hist)
         full_history = "\n".join(parts).strip()
 
-        limit = word_limits.get(key, default_limit)
-        # Summaries
+        # Summary
+        limit = word_limits.get(key, DEFAULT_WORD_LIMIT)
         if client:
             summary_text = llm_summary_from_history(client, full_history, limit, model=model_name)
         else:
             summary_text = heuristic_summary(full_history, limit)
 
-        # Consumption override: not discussed this call AND no prior history → set special message
-        if key == "consumption" and not new_entry and not prev_hist:
+        # Consumption override: if transcript didn't mention consumption → custom message
+        if key == "consumption" and not new_entry:
             summary_text = "Consumption not discussed on call."
 
         # Sentiment: prefer new; if NA and previous exists, keep previous
@@ -425,14 +436,14 @@ if go:
             "history_text": full_history
         }
 
-    # Relationship sentiment rule = mirror Overall
+    # Relationship sentiment rule = mirror Overall (green/yellow/red)
     overall_s = (assembled.get("overall", {}).get("sentiment","") or "").lower()
     if overall_s:
         if "red" in overall_s:
             assembled["relationship"]["sentiment"] = "Red"
         elif "green" in overall_s:
             assembled["relationship"]["sentiment"] = "Green"
-        else:  # middle/amber/yellow/unknown
+        else:  # yellow/amber/middle/unknown
             assembled["relationship"]["sentiment"] = "Yellow"
 
     # Build DOCX
@@ -452,8 +463,8 @@ if go:
         s = assembled[key]
         st.markdown(f"### {label}")
         st.markdown(f"**Sentiment:** {s['sentiment']}")
-        st.markdown(f"**Sentiment Summary** (≤ {word_limits.get(key, default_limit)} words)")
+        st.markdown(f"**Sentiment Summary** (≤ {word_limits.get(key, DEFAULT_WORD_LIMIT)} words)")
         st.write(s["summary"])
         st.markdown("**Sentiment History** (newest first)")
-        for item in history_to_bullets(s["history_text"]) or ["—"]:
+        for item in (lambda h: [f"{d} — {t}" for d,t in [(i.split(' — ',1)[0], i.split(' — ',1)[1] if ' — ' in i else '')] for i in history_to_bullets(h)])(s["history_text"]) or ["—"]:
             st.markdown(f"- {item}")
