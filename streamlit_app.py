@@ -1,8 +1,9 @@
-# app.py — Zoom → Customer Success Tab (.docx) with bullets + rules
+# app.py — Zoom → Customer Success Tab (.docx) with bullets + bold-italics headings + punctuation/linebreak fixes
 # - No runtime installs; only stdlib + streamlit
-# - Bulleted "Sentiment History" per section (proper Word bullets)
-# - Relationship sentiment mirrors Overall (Green/Yellow/Red mapping)
-# - Consumption: if not mentioned in the uploaded transcript → summary = "Consumption not discussed on call."
+# - Bulleted "Sentiment History" with proper Word bullets and real line breaks
+# - Section headings in Word are Bold + Italic
+# - Relationship sentiment mirrors Overall (Green/Yellow/Red)
+# - Consumption: if not mentioned in the transcript → summary = "Consumption not discussed on call."
 # - Optional OpenAI usage if a key is provided; otherwise offline heuristics
 
 import os, io, re, json, zipfile, html, xml.etree.ElementTree as ET
@@ -13,7 +14,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Zoom → Customer Success Tab (Word)", layout="wide")
 st.title("Zoom → Customer Success Tab (Word)")
-st.caption("Upload Zoom transcript (+ optional prior CS-Tab .docx). Appends new history, recomputes summaries, and outputs a beautified Word doc with bullet points.")
+st.caption("Upload Zoom transcript (+ optional prior CS-Tab .docx). Appends new history, recomputes summaries, and outputs a beautified Word doc with bullet points and proper line breaks.")
 
 # ---------------------------
 # Sections & defaults
@@ -165,7 +166,15 @@ def heuristic_extract_new_entries(transcript: str) -> Dict[str, Dict[str,str]]:
 def heuristic_summary(full_history: str, word_limit: int) -> str:
     if not full_history.strip(): return "NA"
     sents = re.split(r'(?<=[.!?])\s+', full_history.strip())
-    text = " ".join(sents[:3]).strip()
+    # ensure each sentence ends with punctuation
+    norm = []
+    for s in sents[:6]:
+        s = s.strip()
+        if not s: continue
+        if not re.search(r'[.!?]$', s): s += '.'
+        norm.append(s)
+        if sum(len(x.split()) for x in norm) >= word_limit: break
+    text = " ".join(norm)
     words = text.split()
     return " ".join(words[:word_limit]) if words else "NA"
 
@@ -225,7 +234,7 @@ Use the exact labels. Keep entries concise. If nothing relevant, use sentiment='
 def llm_summary_from_history(client, history: str, word_limit: int, model="gpt-4o-mini") -> str:
     if not history.strip(): return "NA"
     prompt = f"""Write a single-paragraph 'Sentiment Summary' (≤ {word_limit} words) based on the entire history below (newest first).
-Be specific, concise, and reflect current state/trends/next steps. If trivial, return 'NA'.
+Be specific, concise, and reflect current state/trends/next steps. Ensure proper sentence punctuation and line breaks when appropriate. If trivial, return 'NA'.
 History:
 \"\"\"{history[:120000]}\"\"\""""
     try:
@@ -237,11 +246,19 @@ History:
     except Exception:
         text = ""
     if not text: return "NA"
-    words = text.split()
+    # enforce word limit & sentence termination
+    sents = re.split(r'(?<=[.!?])\s+', text)
+    norm = []
+    for s in sents:
+        s = s.strip()
+        if not s: continue
+        if not re.search(r'[.!?]$', s): s += '.'
+        norm.append(s)
+    words = " ".join(norm).split()
     return " ".join(words[:word_limit]) if words else "NA"
 
 # ---------------------------
-# Tiny DOCX builder with bullets
+# Tiny DOCX builder with bullets + bold/italics headings
 # ---------------------------
 CONTENT_TYPES_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -257,12 +274,13 @@ RELS_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>
 """
-# Relationship from document to numbering part (helps some Word viewers)
+# relationship to numbering part
 DOC_RELS_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rIdNum" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
 </Relationships>
 """
+# Heading2 is bold + italic now
 STYLES_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
@@ -276,11 +294,11 @@ STYLES_XML = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   <w:style w:type="paragraph" w:styleId="Heading2">
     <w:name w:val="Heading 2"/><w:qFormat/>
     <w:pPr><w:spacing w:after="80"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="28"/></w:rPr>
+    <w:rPr><w:b/><w:i/><w:sz w:val="28"/></w:rPr>
   </w:style>
 </w:styles>
 """
-# Bullet numbering (numId 1) — Unicode string encoded to UTF-8 to allow "•"
+# Proper bullet numbering (numId 1) — UTF-8 to allow "•"
 NUMBERING_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:abstractNum w:abstractNumId="0">
@@ -294,9 +312,11 @@ NUMBERING_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 </w:numbering>
 """.encode("utf-8")
 
-def par(style: Optional[str], text: str, bold=False) -> str:
+def par(style: Optional[str], text: str, bold=False, italic=False) -> str:
     text = html.escape(text).replace("\n", "<w:br/>")
-    rpr = "<w:rPr><w:b/></w:rPr>" if bold else ""
+    b = "<w:b/>" if bold else ""
+    i = "<w:i/>" if italic else ""
+    rpr = f"<w:rPr>{b}{i}</w:rPr>" if (bold or italic) else ""
     ppr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
     return f'<w:p>{ppr}<w:r>{rpr}<w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
 
@@ -305,28 +325,40 @@ def bullet_par(text: str, level: int = 0) -> str:
     num = f'<w:pPr><w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="1"/></w:numPr></w:pPr>'
     return f'<w:p>{num}<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
 
+def ensure_sentence_end(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return s
+    if not re.search(r'[.!?]$', s):
+        s += '.'
+    return s
+
 def history_to_bullets(history_text: str) -> List[str]:
-    """Collapse history into bullets: 'Month YYYY — summary' per item (newest-first block)."""
+    """One bullet per date block.
+       First line = Month YYYY, following lines = statements with proper periods."""
     if not history_text.strip(): return []
-    lines = [l.strip() for l in history_text.splitlines() if l.strip()]
+    lines = [l.rstrip() for l in history_text.splitlines() if l.strip()]
     bullets, current_date, buf = [], None, []
     for ln in lines:
         if re.match(MONTH_RX, ln):
             if current_date or buf:
-                bullets.append(f"{current_date} — {' '.join(buf).strip()}")
+                # build bullet text with line breaks and periods
+                statements = [ensure_sentence_end(x) for x in buf if x.strip()]
+                bullets.append((current_date or "").strip() + ("\n" + "\n".join(statements) if statements else ""))
             current_date, buf = ln, []
         else:
             buf.append(ln)
     if current_date or buf:
-        date_prefix = f"{current_date} — " if current_date else ""
-        bullets.append(f"{date_prefix}{' '.join(buf).strip()}")
+        statements = [ensure_sentence_end(x) for x in buf if x.strip()]
+        bullets.append((current_date or "").strip() + ("\n" + "\n".join(statements) if statements else ""))
     return bullets
 
 def build_docx_bytes(title: str, assembled: Dict[str, Dict[str, str]]) -> bytes:
-    body = [par("Title", title)]
+    body = [par("Title", title, bold=True)]
     for key, label in SECTION_ORDER:
         s = assembled.get(key, {})
-        body.append(par("Heading2", label))
+        # Heading in Bold + Italic
+        body.append(par("Heading2", label, bold=True, italic=True))
         body.append(par(None, "Sentiment", bold=True))
         body.append(par(None, (s.get("sentiment") or "NA")))
         body.append(par(None, "Sentiment Summary", bold=True))
@@ -443,7 +475,7 @@ if go:
             assembled["relationship"]["sentiment"] = "Red"
         elif "green" in overall_s:
             assembled["relationship"]["sentiment"] = "Green"
-        else:  # yellow/amber/middle/unknown
+        else:
             assembled["relationship"]["sentiment"] = "Yellow"
 
     # Build DOCX
@@ -452,19 +484,21 @@ if go:
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
     fname = f"CS_Tab_{account or 'Account'}_{stamp}.docx"
 
-    st.success("Document generated with bulleted histories and custom rules.")
+    st.success("Document generated with bold-italics headings, proper bullets, and fixed punctuation/line breaks.")
     st.download_button("Download Word document", data=doc_bytes, file_name=fname,
                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-    # Preview
+    # Preview (use Markdown line breaks within list items)
     st.divider()
     st.subheader("Preview")
     for key, label in SECTION_ORDER:
         s = assembled[key]
-        st.markdown(f"### {label}")
+        st.markdown(f"### ***{label}***")
         st.markdown(f"**Sentiment:** {s['sentiment']}")
         st.markdown(f"**Sentiment Summary** (≤ {word_limits.get(key, DEFAULT_WORD_LIMIT)} words)")
         st.write(s["summary"])
         st.markdown("**Sentiment History** (newest first)")
-        for item in (lambda h: [f"{d} — {t}" for d,t in [(i.split(' — ',1)[0], i.split(' — ',1)[1] if ' — ' in i else '')] for i in history_to_bullets(h)])(s["history_text"]) or ["—"]:
-            st.markdown(f"- {item}")
+        items = history_to_bullets(s["history_text"]) or ["—"]
+        for item in items:
+            md_item = item.replace("\n", "  \n  ")  # markdown line breaks within the bullet
+            st.markdown(f"- {md_item}")
